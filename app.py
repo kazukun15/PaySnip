@@ -4,13 +4,13 @@ import io
 import zipfile
 import re
 import time
+import numpy as np
 from datetime import datetime
 from typing import List, Dict, Optional
 from pypdf import PdfReader, PdfWriter
 import fitz  # PyMuPDF for PDF rendering
-import pytesseract
-import google.generativeai as genai
-from google.api_core.exceptions import InternalServerError
+from PIL import Image
+import easyocr
 
 # ── アプリ設定 ─────────────────────────────────
 st.set_page_config(page_title="支払通知書抽出ツール", layout="wide")
@@ -21,6 +21,7 @@ st.sidebar.header("ファイルアップロード")
 pdf_file = st.sidebar.file_uploader("PDFファイル (.pdf)", type="pdf")
 csv_file = st.sidebar.file_uploader("CSVファイル (.csv)", type="csv")
 st.sidebar.markdown("---")
+# Gemini補正オプション
 st.sidebar.header("オプション設定")
 enable_refine = st.sidebar.checkbox("Geminiによるテキスト補正を有効にする", value=False)
 action_preview = st.sidebar.button("プレビュー")
@@ -28,7 +29,8 @@ action_extract = st.sidebar.button("抽出")
 
 # ── Geminiモデル初期化 ──────────────────────────────
 @st.cache_resource
-def init_gemini_model(api_key: str) -> Optional[genai.GenerativeModel]:
+def init_gemini_model(api_key: str) -> Optional:
+    import google.generativeai as genai
     if not api_key:
         return None
     genai.configure(api_key=api_key)
@@ -39,6 +41,13 @@ def init_gemini_model(api_key: str) -> Optional[genai.GenerativeModel]:
 
 gemini_api_key = st.secrets.get("gemini", {}).get("api_key", "")
 model = init_gemini_model(gemini_api_key)
+
+# ── OCRリーダー初期化 (pure Python via easyocr) ─────────────────────────
+@st.cache_resource
+def get_easyocr_reader():
+    # GPU=FalseでCPUモード
+    return easyocr.Reader(['ja'], gpu=False)
+ocr_reader = get_easyocr_reader()
 
 # ── ユーティリティ関数 ─────────────────────────────
 def normalize_text(text: str) -> str:
@@ -76,16 +85,17 @@ def load_pdf_bytes(file) -> bytes:
     file.seek(0)
     return file.read()
 
-# OCR用: PyMuPDF + pytesseract
+# ── OCR用関数: PyMuPDF + easyocr ─────────────────────────
 def ocr_page(fitz_doc: fitz.Document, page_num: int) -> str:
     """ページを画像化してOCRテキストを取得"""
     page = fitz_doc.load_page(page_num)
     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), colorspace=fitz.csRGB)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    text = pytesseract.image_to_string(img, lang='jpn')
-    return text
+    arr = np.array(img)
+    texts = ocr_reader.readtext(arr, detail=0)
+    return "\n".join(texts)
 
-# マッチング関数
+# ── マッチング関数 ─────────────────────────────────
 def find_matches(
     reader: PdfReader,
     fitz_doc: fitz.Document,
@@ -96,7 +106,7 @@ def find_matches(
     results = []
     for idx, page in enumerate(reader.pages, start=1):
         raw = page.extract_text() or ""
-        # OCR併用: テキスト層が空または短い場合、OCRを付加
+        # テキストが短い場合はOCRを併用
         if len(raw.strip()) < 20:
             raw += "\n" + ocr_page(fitz_doc, idx-1)
         text = refine_text(raw, idx)
@@ -123,11 +133,12 @@ if not pdf_file or not csv_file:
     st.warning("PDFとCSVをアップロードしてください。")
     st.stop()
 
-# データ読み込み
+# データ読込
 csv_df = load_csv(csv_file)
 pdf_bytes = load_pdf_bytes(pdf_file)
 pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
 fitz_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
 names = csv_df.get("相手方", pd.Series()).dropna().str.strip().tolist()
 accounts = sum(
     [csv_df.get(col, pd.Series()).dropna().str.strip().tolist() for col in ["口座番号１","口座番号２","口座番号３"]], []
