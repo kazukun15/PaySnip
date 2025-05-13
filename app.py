@@ -6,18 +6,18 @@ import re
 from datetime import datetime
 from pdf2image import convert_from_bytes
 import pytesseract
-from google import genai
+import google.generativeai as genai  # Gemini 用 SDKを正しいモジュールでインポート
 
 # ── Streamlit 設定 ─────────────────────────────────
 st.set_page_config(page_title="OCR＋Gemini 支払通知書抽出", layout="wide")
 st.title("OCR＋Gemini 支払通知書抽出ツール")
 
 # ── Gemini クライアント初期化 ─────────────────────────
-# secrets.toml に以下のように設定してください:
+# secrets.toml に以下を設定してください:
 # [gemini]
 # api_key = "YOUR_GEMINI_API_KEY"
 gemini_api_key = st.secrets["gemini"]["api_key"]
-genai_client = genai.Client(api_key=gemini_api_key)
+genai.configure(api_key=gemini_api_key)  # APIキーを直接設定
 
 # ── テキスト正規化・精緻化関数 ─────────────────────────
 def normalize_text(text: str) -> str:
@@ -25,15 +25,13 @@ def normalize_text(text: str) -> str:
 
 def refine_with_gemini(raw_text: str) -> str:
     prompt = (
-        "以下のOCRテキストを日本語として正確に修正してください:\n```" 
+        "以下のOCRテキストを日本語として正確に修正してください:\n```"
         + raw_text + "```"
     )
-    response = genai_client.models.generate_content(
+    response = genai.generate_content(
         model="gemini-2.5-flash-preview-04-17",
         contents=prompt,
-        config=genai.types.GenerateContentConfig(
-            thinking_config=genai.types.ThinkingConfig(thinking_budget=1024)
-        )
+        thinking_config=genai.ThinkingConfig(thinking_budget=1024)
     )
     return response.text
 
@@ -67,6 +65,10 @@ if pdf_file and csv_file:
     # PDFバイト読み取り
     pdf_bytes = pdf_file.read()
     pdf_file.seek(0)
+
+    # --- デバッグ: テキストレイヤー確認 ---
+    reader_debug = convert_from_bytes(pdf_bytes, dpi=200)
+    st.write(f"▶ PDF ページ数（プレビュー画像として）: {len(reader_debug)}")
 
     # --- プレビュー実行 ---
     if st.button("プレビュー実行"):
