@@ -49,42 +49,17 @@ def refine_text(raw: str, page: int) -> str:
     if not (model and enable_refine):
         return raw
     try:
-        prompt = (
-            f"PDFの{page}ページから抽出された支払通知書テキストを、"+
-            "誤字脱字なく自然な日本語に修正してください。"
-            f"\n```
+        # プロンプトにバックティックを含めず、シンプルな文章形式に変更してf-stringエラー回避
+        prompt = f"""PDFの{page}ページから抽出された支払通知書のテキストを、誤字脱字なく自然な日本語に修正してください。
+
 {raw}
-```"
-        )
+"""
         res = model.generate_content(prompt)
         return res.text
     except InternalServerError:
         return raw
     except Exception:
         return raw
-
-@st.cache_data
-def load_csv(file) -> pd.DataFrame:
-    """CSVをUTF-8/CP932/Shift-JISで読み込み"""
-    for enc in ("utf-8", "cp932", "shift-jis"):
-        try:
-            file.seek(0)
-            return pd.read_csv(file, dtype=str, encoding=enc)
-        except Exception:
-            continue
-    st.error("CSV読み込み失敗: エンコーディングを確認してください")
-    st.stop()
-
-@st.cache_data
-def load_pdf_reader(file) -> PdfReader:
-    """PDFを読み込みPdfReaderを返す"""
-    file.seek(0)
-    data = file.read()
-    reader = PdfReader(io.BytesIO(data))
-    if not reader.pages:
-        st.error("PDFにページが含まれていません")
-        st.stop()
-    return reader
 
 # ── マッチング処理 ─────────────────────────────────
 def find_matches(
