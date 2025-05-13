@@ -4,3 +4,4 @@ pytesseract
 streamlit
 pandas
 google-generativeai
+easyocr
