@@ -16,29 +16,34 @@ csv_file = st.file_uploader("CSVファイルをアップロード", type="csv")
 # テキスト正規化関数
 def normalize_text(text: str) -> str:
     return ''.join(text.split())  # 空白や改行を除去
+
 def normalize_digits(text: str) -> str:
     return re.sub(r"\D", "", text)  # 数字以外を除去
 
 # PDFページからマッチを検出する関数
-def find_matches(pdf_stream, targets):
+def find_matches(pdf_stream, name_targets, account_targets):
     reader = PdfReader(pdf_stream)
     matches = []
     for i, page in enumerate(reader.pages, start=1):
         raw = page.extract_text() or ""
         text_norm = normalize_text(raw)
         digits_norm = normalize_digits(raw)
-        for t in targets:
-            t_norm = normalize_text(t)
-            # 数字を含むターゲットは数字正規化テキストでマッチ
-            if re.search(r"\d", t):
-                if normalize_digits(t) in digits_norm:
-                    matches.append({"page": i, "match": t})
+        matched = None
+        # 1. 相手方名で優先マッチ
+        for name in name_targets:
+            name_norm = normalize_text(name)
+            if name_norm.lower() in text_norm.lower():
+                matched = name
+                break
+        # 2. 相手方名が見つからない場合、口座番号で補助マッチ
+        if not matched:
+            for acc in account_targets:
+                acc_norm = normalize_digits(acc)
+                if acc_norm and acc_norm in digits_norm:
+                    matched = acc
                     break
-            else:
-                # 名前など文字ターゲットは空白除去テキストでマッチ（大文字小文字同一視）
-                if t_norm.lower() in text_norm.lower():
-                    matches.append({"page": i, "match": t})
-                    break
+        if matched:
+            matches.append({"page": i, "match": matched})
     return matches
 
 if pdf_file and csv_file:
@@ -59,25 +64,27 @@ if pdf_file and csv_file:
     st.dataframe(df)
 
     # --- 3. マッチ対象文字列の抽出 ---
-    targets = set()
-    for col in ["相手方", "口座番号１", "口座番号２", "口座番号３"]:
+    name_targets = set()
+    account_targets = set()
+    if "相手方" in df.columns:
+        name_targets = set(df["相手方"].dropna().astype(str).str.strip())
+    for col in ["口座番号１", "口座番号２", "口座番号３"]:
         if col in df.columns:
-            values = df[col].dropna().astype(str).str.strip()
-            targets |= set(values)
+            account_targets |= set(df[col].dropna().astype(str).str.strip())
 
-    # プレビュー
+    # --- 4. プレビュー実行 ---
     if st.button("プレビュー実行"):
-        matches = find_matches(pdf_file, targets)
+        matches = find_matches(pdf_file, name_targets, account_targets)
         if matches:
             preview_df = pd.DataFrame(matches)
-            st.subheader("マッチしたページ一覧")
+            st.subheader("マッチしたページ一覧（相手方優先、口座番号補助）")
             st.dataframe(preview_df)
         else:
             st.info("一致するページが見つかりませんでした。")
 
-    # 抽出実行＆ZIPダウンロード
+    # --- 5. 抽出実行＆ZIPダウンロード ---
     if st.button("抽出実行"):
-        matches = find_matches(pdf_file, targets)
+        matches = find_matches(pdf_file, name_targets, account_targets)
         if not matches:
             st.error("一致するページがないため、抽出できません。")
             st.stop()
@@ -92,7 +99,9 @@ if pdf_file and csv_file:
                 writer.add_page(reader.pages[page_no - 1])
                 pdf_bytes = io.BytesIO()
                 writer.write(pdf_bytes)
-                name = f"{datetime.now():%Y%m%d}_支払通知書_{match_str}_p{page_no}.pdf"
+                # ファイル名：日付_支払通知書_相手方または口座番号_pページ.pdf
+                safe_str = re.sub(r"[\\/:*?\"<>|]", "_", match_str)
+                name = f"{datetime.now():%Y%m%d}_支払通知書_{safe_str}_p{page_no}.pdf"
                 zipf.writestr(name, pdf_bytes.getvalue())
 
         zip_buffer.seek(0)
