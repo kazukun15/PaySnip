@@ -5,27 +5,26 @@ import zipfile
 import re
 import time
 from datetime import datetime
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 from pypdf import PdfReader, PdfWriter
 import google.generativeai as genai
 from google.api_core.exceptions import InternalServerError
 
-# ── Streamlit 設定 ─────────────────────────────────
+# ── アプリ設定 ─────────────────────────────────
 st.set_page_config(page_title="支払通知書抽出ツール", layout="wide")
 st.title("📄 支払通知書抽出ツール")
 
-# ── サイドバー：ファイル選択・設定 ─────────────────────────
-st.sidebar.header("1. ファイルをアップロード")
+# ── サイドバー ────────────────────────────────────
+st.sidebar.header("ファイルアップロード")
 pdf_file = st.sidebar.file_uploader("PDFファイル (.pdf)", type="pdf")
 csv_file = st.sidebar.file_uploader("CSVファイル (.csv)", type="csv")
+st.sidebar.markdown("---")
+st.sidebar.header("オプション設定")
+enable_refine = st.sidebar.checkbox("Geminiによるテキスト補正を有効にする", value=False)
+action_preview = st.sidebar.button("プレビュー")
+action_extract = st.sidebar.button("抽出")
 
-st.sidebar.header("2. オプション")
-enable_refine = st.sidebar.checkbox("Gemini 補正を有効にする", value=False)
-
-action_preview = st.sidebar.button("プレビュー実行")
-action_extract = st.sidebar.button("抽出実行")
-
-# ── Gemini モデル初期化 ─────────────────────────────────
+# ── Geminiモデル初期化 ──────────────────────────────
 @st.cache_resource
 def init_gemini_model(api_key: str) -> Optional[genai.GenerativeModel]:
     if not api_key:
@@ -39,21 +38,21 @@ def init_gemini_model(api_key: str) -> Optional[genai.GenerativeModel]:
 gemini_api_key = st.secrets.get("gemini", {}).get("api_key", "")
 model = init_gemini_model(gemini_api_key)
 
-# ── ユーティリティ関数 ─────────────────────────────────
+# ── ユーティリティ関数 ─────────────────────────────
 def normalize_text(text: str) -> str:
-    """空白除去して比較しやすくする"""
+    """空白と改行を除去し比較用に正規化"""
     return re.sub(r"\s+", "", text)
 
 def refine_text(raw: str, page: int) -> str:
-    """Gemini APIで誤りを補正（APIエラーなら生テキスト返却）"""
-    if not (model and enable_refine):
+    """Gemini APIでテキストを補正。失敗時は生テキストを返す"""
+    if not model or not enable_refine:
         return raw
     try:
-        # プロンプトにバックティックを含めず、シンプルな文章形式に変更してf-stringエラー回避
-        prompt = f"""PDFの{page}ページから抽出された支払通知書のテキストを、誤字脱字なく自然な日本語に修正してください。
-
-{raw}
-"""
+        prompt = (
+            f"PDFの{page}ページから抽出された支払通知書テキストを、"
+            "誤字脱字なく自然な日本語に修正してください。"
+            f"\nテキスト: {raw}"
+        )
         res = model.generate_content(prompt)
         return res.text
     except InternalServerError:
@@ -61,93 +60,109 @@ def refine_text(raw: str, page: int) -> str:
     except Exception:
         return raw
 
-# ── マッチング処理 ─────────────────────────────────
+@st.cache_data
+def load_csv(file) -> pd.DataFrame:
+    """UTF-8, CP932, Shift-JISを順に試行してCSVを読み込む"""
+    for enc in ("utf-8", "cp932", "shift-jis"):
+        try:
+            file.seek(0)
+            return pd.read_csv(file, dtype=str, encoding=enc)
+        except Exception:
+            continue
+    st.error("CSVの読み込みに失敗しました。Encodingを確認してください。")
+    st.stop()
+
+@st.cache_data
+def load_pdf_reader(file) -> PdfReader:
+    """PDFを読み込みPdfReaderを返す"""
+    file.seek(0)
+    data = file.read()
+    reader = PdfReader(io.BytesIO(data))
+    if not reader.pages:
+        st.error("PDFに有効なページが含まれていません。")
+        st.stop()
+    return reader
+
+# ── マッチング関数 ─────────────────────────────────
 def find_matches(
     reader: PdfReader,
     names: List[str],
-    accounts: List[str],
+    accounts: List[str]
 ) -> List[Dict]:
-    """テキストレイヤー → 補正 → 名前 or 口座番号でマッチ"""
+    """PDFテキストレイヤーを読み取り、名前優先・口座番号補助でマッチするページを返す"""
     results = []
     total = len(reader.pages)
     for idx in range(total):
         raw = reader.pages[idx].extract_text() or ""
-        text = raw
-        # 補正テキスト
-        if enable_refine:
-            text = refine_text(raw, idx+1)
+        text = refine_text(raw, idx+1)
         norm = normalize_text(text)
-        matched: Optional[str] = None
-        # 名前優先
+        found = None
+        # 名前マッチ
         for name in names:
             if normalize_text(name) in norm:
-                matched = name
+                found = name
                 break
-        # 口座番号補助
-        if not matched:
+        # 補助: 口座番号
+        if not found:
             digits = re.sub(r"\D", "", text)
             for acc in accounts:
                 if re.sub(r"\D", "", acc) in digits:
-                    matched = acc
+                    found = acc
                     break
-        if matched:
-            results.append({"page": idx+1, "match": matched})
+        if found:
+            results.append({"page": idx+1, "match": found})
     return results
 
-# ── アプリ本体 ─────────────────────────────────────────
+# ── アプリ本体 ─────────────────────────────────────
 if not pdf_file or not csv_file:
-    st.warning("PDFとCSVを両方アップロードしてください。")
+    st.warning("PDFとCSVをアップロードしてください。")
     st.stop()
 
 # データ読み込み
 csv_df = load_csv(csv_file)
 pdf_reader = load_pdf_reader(pdf_file)
 names = csv_df.get("相手方", pd.Series()).dropna().str.strip().tolist()
-accounts = sum([csv_df.get(c, pd.Series()).dropna().str.strip().tolist()
-                for c in ["口座番号１","口座番号２","口座番号３"]], [])
+accounts = sum(
+    [csv_df.get(col, pd.Series()).dropna().str.strip().tolist() for col in ["口座番号１","口座番号２","口座番号３"]], []
+)
 
-st.subheader("CSV プレビュー")
+# プレビュー表示
+st.subheader("CSVサマリ")
 st.dataframe(csv_df.head(5))
-st.write(f"アップロードPDFページ数: {len(pdf_reader.pages)} ページ")
+st.write(f"PDFページ数: {len(pdf_reader.pages)}")
 
-# プレビュー
 if action_preview:
-    with st.spinner("プレビュー実行中…"):
+    with st.spinner("プレビュー中…"):
         t0 = time.time()
         preview = find_matches(pdf_reader, names, accounts)
-        dt = time.time() - t0
-    st.success(f"プレビュー完了 ({dt:.2f}秒)")
+        elapsed = time.time() - t0
+    st.success(f"プレビュー完了 ({elapsed:.2f}s)")
     if preview:
         st.table(pd.DataFrame(preview))
     else:
-        st.warning("一致するページがありませんでした。")
+        st.info("一致するページがありません。")
 
-# 抽出
+# 抽出処理
 if action_extract:
-    with st.spinner("抽出実行中…"):
+    with st.spinner("抽出中…"):
         t0 = time.time()
         matches = find_matches(pdf_reader, names, accounts)
-        # ZIP作成
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for m in matches:
-                page = m['page'] - 1
+            for item in matches:
+                pg = item['page'] - 1
                 writer = PdfWriter()
-                writer.add_page(pdf_reader.pages[page])
-                b = io.BytesIO()
-                writer.write(b)
-                safe = re.sub(r"[\\/:*?\"<>|]", "_", m['match'])
-                fname = f"{datetime.now():%Y%m%d}_支払通知書_{safe}_p{m['page']}.pdf"
+                writer.add_page(pdf_reader.pages[pg])
+                b = io.BytesIO(); writer.write(b)
+                safe = re.sub(r"[\\/:*?\"<>|]", "_", item['match'])
+                fname = f"{datetime.now():%Y%m%d}_支払通知書_{safe}_p{item['page']}.pdf"
                 zf.writestr(fname, b.getvalue())
         buf.seek(0)
-        dt = time.time() - t0
+        elapsed = time.time() - t0
     if matches:
-        st.success(f"抽出完了 ({dt:.2f}秒) - {len(matches)}ページをZIP化しました。")
-        st.download_button(
-            "ZIPダウンロード", buf,
-            file_name=f"{datetime.now():%Y%m%d}_支払通知書.zip"
-        )
-        st.subheader("抽出結果詳細")
+        st.success(f"抽出完了 ({elapsed:.2f}s) - {len(matches)}ページを出力しました。")
+        st.download_button("ZIPダウンロード", buf, file_name=f"{datetime.now():%Y%m%d}_支払通知書.zip")
+        st.subheader("抽出結果一覧")
         st.dataframe(pd.DataFrame(matches))
     else:
-        st.warning(f"抽出対象のページが見つかりませんでした。 ({dt:.2f}秒)")
+        st.warning(f"抽出対象が見つかりませんでした。 ({elapsed:.2f}s) ")
