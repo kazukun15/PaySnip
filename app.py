@@ -49,9 +49,8 @@ def refine_text(raw: str, page: int) -> str:
         return raw
     try:
         prompt = (
-            f"PDFの{page}ページから抽出された支払通知書テキストを、"
-            "誤字脱字なく自然な日本語に修正してください。"
-            f"\nテキスト: {raw}"
+            f"PDFの{page}ページから抽出された支払通知書テキストを、誤字脱字なく自然な日本語に修正してください。"
+            f"\n{raw}"
         )
         res = model.generate_content(prompt)
         return res.text
@@ -73,15 +72,10 @@ def load_csv(file) -> pd.DataFrame:
     st.stop()
 
 @st.cache_data
-def load_pdf_reader(file) -> PdfReader:
-    """PDFを読み込みPdfReaderを返す"""
+def load_pdf_bytes(file) -> bytes:
+    """アップロードPDFからバイト列を読み込む"""
     file.seek(0)
-    data = file.read()
-    reader = PdfReader(io.BytesIO(data))
-    if not reader.pages:
-        st.error("PDFに有効なページが含まれていません。")
-        st.stop()
-    return reader
+    return file.read()
 
 # ── マッチング関数 ─────────────────────────────────
 def find_matches(
@@ -91,10 +85,9 @@ def find_matches(
 ) -> List[Dict]:
     """PDFテキストレイヤーを読み取り、名前優先・口座番号補助でマッチするページを返す"""
     results = []
-    total = len(reader.pages)
-    for idx in range(total):
-        raw = reader.pages[idx].extract_text() or ""
-        text = refine_text(raw, idx+1)
+    for idx, page in enumerate(reader.pages, start=1):
+        raw = page.extract_text() or ""
+        text = refine_text(raw, idx)
         norm = normalize_text(text)
         found = None
         # 名前マッチ
@@ -110,7 +103,7 @@ def find_matches(
                     found = acc
                     break
         if found:
-            results.append({"page": idx+1, "match": found})
+            results.append({"page": idx, "match": found})
     return results
 
 # ── アプリ本体 ─────────────────────────────────────
@@ -120,7 +113,8 @@ if not pdf_file or not csv_file:
 
 # データ読み込み
 csv_df = load_csv(csv_file)
-pdf_reader = load_pdf_reader(pdf_file)
+pdf_bytes = load_pdf_bytes(pdf_file)
+pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
 names = csv_df.get("相手方", pd.Series()).dropna().str.strip().tolist()
 accounts = sum(
     [csv_df.get(col, pd.Series()).dropna().str.strip().tolist() for col in ["口座番号１","口座番号２","口座番号３"]], []
