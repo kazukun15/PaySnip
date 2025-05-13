@@ -7,6 +7,8 @@ import time
 from datetime import datetime
 from typing import List, Dict, Optional
 from pypdf import PdfReader, PdfWriter
+import fitz  # PyMuPDF for PDF rendering
+import pytesseract
 import google.generativeai as genai
 from google.api_core.exceptions import InternalServerError
 
@@ -49,13 +51,10 @@ def refine_text(raw: str, page: int) -> str:
         return raw
     try:
         prompt = (
-            f"PDFの{page}ページから抽出された支払通知書テキストを、誤字脱字なく自然な日本語に修正してください。"
-            f"\n{raw}"
+            f"PDFの{page}ページから抽出された支払通知書テキストを、誤字脱字なく自然な日本語に修正してください。\n" + raw
         )
         res = model.generate_content(prompt)
         return res.text
-    except InternalServerError:
-        return raw
     except Exception:
         return raw
 
@@ -77,16 +76,29 @@ def load_pdf_bytes(file) -> bytes:
     file.seek(0)
     return file.read()
 
-# ── マッチング関数 ─────────────────────────────────
+# OCR用: PyMuPDF + pytesseract
+def ocr_page(fitz_doc: fitz.Document, page_num: int) -> str:
+    """ページを画像化してOCRテキストを取得"""
+    page = fitz_doc.load_page(page_num)
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), colorspace=fitz.csRGB)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    text = pytesseract.image_to_string(img, lang='jpn')
+    return text
+
+# マッチング関数
 def find_matches(
     reader: PdfReader,
+    fitz_doc: fitz.Document,
     names: List[str],
     accounts: List[str]
 ) -> List[Dict]:
-    """PDFテキストレイヤーを読み取り、名前優先・口座番号補助でマッチするページを返す"""
+    """テキスト層＋OCR併用でマッチング"""
     results = []
     for idx, page in enumerate(reader.pages, start=1):
         raw = page.extract_text() or ""
+        # OCR併用: テキスト層が空または短い場合、OCRを付加
+        if len(raw.strip()) < 20:
+            raw += "\n" + ocr_page(fitz_doc, idx-1)
         text = refine_text(raw, idx)
         norm = normalize_text(text)
         found = None
@@ -115,6 +127,7 @@ if not pdf_file or not csv_file:
 csv_df = load_csv(csv_file)
 pdf_bytes = load_pdf_bytes(pdf_file)
 pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+fitz_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 names = csv_df.get("相手方", pd.Series()).dropna().str.strip().tolist()
 accounts = sum(
     [csv_df.get(col, pd.Series()).dropna().str.strip().tolist() for col in ["口座番号１","口座番号２","口座番号３"]], []
@@ -128,7 +141,7 @@ st.write(f"PDFページ数: {len(pdf_reader.pages)}")
 if action_preview:
     with st.spinner("プレビュー中…"):
         t0 = time.time()
-        preview = find_matches(pdf_reader, names, accounts)
+        preview = find_matches(pdf_reader, fitz_doc, names, accounts)
         elapsed = time.time() - t0
     st.success(f"プレビュー完了 ({elapsed:.2f}s)")
     if preview:
@@ -140,7 +153,7 @@ if action_preview:
 if action_extract:
     with st.spinner("抽出中…"):
         t0 = time.time()
-        matches = find_matches(pdf_reader, names, accounts)
+        matches = find_matches(pdf_reader, fitz_doc, names, accounts)
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
             for item in matches:
