@@ -1,4 +1,6 @@
 streamlit
 pandas
+pdf2image
+pytesseract
 pypdf
-pdfminer.six
+google-generativeai
