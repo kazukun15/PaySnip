@@ -1,77 +1,92 @@
-# --- Streamlit 完全アプリ例：PDF画像＋CSV照合 ---
-# 画像上のマーカー名をOCRし、CSVとマッチしてハイライト表示
-# 必要パッケージ: streamlit, pandas, pillow, pytesseract
-# 注意: pytesseract実行環境/日本語OCRはtesseract本体+言語データ必須
-
 import streamlit as st
 import pandas as pd
+import fitz  # PyMuPDF
 from PIL import Image
-import pytesseract
 import io
 
-# --- CSV読込：複数エンコード自動判定 ---
-def read_csv_any_encoding(uploaded_file):
-    encodings = ['utf-8', 'shift_jis', 'cp932', 'utf-16']
-    for enc in encodings:
-        uploaded_file.seek(0)  # ファイルポインタを先頭に戻す
-        try:
-            df = pd.read_csv(uploaded_file, encoding=enc, dtype=str)
-            return df
-        except Exception as e:
-            continue
-    st.error('CSVファイルの読み込みに失敗しました。エンコードを確認してください。')
-    return None
+# 必要に応じて pytesseract のインポートを囲みます（環境によってはインポートできないため）
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+    st.error('pytesseract がインストールされていません。OCR 機能は利用できません。')
 
-# --- 画像からマーカ部分のOCR抽出 ---
-def ocr_image(image, lang='jpn'):
-    # 必要に応じて領域指定 or 前処理も追加
-    text = pytesseract.image_to_string(image, lang=lang)
-    return text
-
-# --- メイン画面 ---
-st.title('PDF画像OCR×CSVマッチングツール')
-
-uploaded_img = st.file_uploader('画像ファイルをアップロード (PNG/JPG)', type=['png','jpg','jpeg'])
-uploaded_csv = st.file_uploader('CSVファイルをアップロード', type=['csv'])
-
-if uploaded_img and uploaded_csv:
-    image = Image.open(uploaded_img)
-    st.image(image, caption='アップロード画像', use_column_width=True)
-    
-    # OCR結果表示
-    st.subheader('OCR抽出結果（画像全体）')
-    ocr_txt = ocr_image(image, lang='jpn')
-    st.code(ocr_txt)
-
-    # CSV読込
-    df = read_csv_any_encoding(uploaded_csv)
-    if df is not None:
-        st.subheader('CSVプレビュー')
-        st.dataframe(df)
-        
-        # CSV内のどの列と照合するか選択
-        colname = st.selectbox('照合に使うCSV列名を選択してください', df.columns)
-
-        # OCR抽出テキストとマッチする行を抽出
-        matches = df[df[colname].astype(str).apply(lambda x: any(word in ocr_txt for word in x.split()))]
-
-        st.subheader('マッチした行')
-        if not matches.empty:
-            st.dataframe(matches)
+def read_pdf_text(pdf_file):
+    """
+    PDFを1ページずつ画像としてOCRで読み取り、各ページのテキストをリストで返す。
+    """
+    pdf = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    texts = []
+    for page_num in range(len(pdf)):
+        page = pdf.load_page(page_num)
+        pix = page.get_pixmap()
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        if TESSERACT_AVAILABLE:
+            text = pytesseract.image_to_string(img, lang='jpn')
         else:
-            st.info('OCR結果とマッチする行が見つかりませんでした。')
-else:
-    st.info('画像ファイルとCSVファイルの両方をアップロードしてください。')
+            text = '(OCR不可)'
+        texts.append(text)
+    return texts
 
-# --- 補足説明・イメージ図 ---
-st.markdown("""
----
-### 【イメージ図】
+def load_csv(csv_file):
+    # 自動判別でエンコーディングを推測
+    try:
+        df = pd.read_csv(csv_file, dtype=str, encoding='utf-8')
+    except UnicodeDecodeError:
+        try:
+            csv_file.seek(0)
+            df = pd.read_csv(csv_file, dtype=str, encoding='cp932')
+        except Exception as e:
+            st.error(f'CSV読み込みエラー: {e}')
+            return None
+    return df
 
-以下の流れで処理を行います：
+def main():
+    st.title('PDF名寄せOCR照合アプリ')
+    st.write('PDFに書かれている名前（OCRで抽出）とCSVの名簿を照合します。')
 
-1. ![Step1](https://img.icons8.com/ios-filled/50/000000/upload.png) 画像ファイルアップロード → 画像内のオレンジマーカー部分をOCRでテキスト化
-2. ![Step2](https://img.icons8.com/ios-filled/50/000000/spreadsheet.png) CSVファイルアップロード → 名前などと照合
-3. ![Step3](https://img.icons8.com/ios-filled/50/000000/search.png) OCRテキストとCSVをマッチング → 一致行のみ表示
+    pdf_file = st.file_uploader('PDFをアップロード', type=['pdf'])
+    csv_file = st.file_uploader('CSV名簿をアップロード', type=['csv'])
 
-""")
+    if pdf_file and csv_file:
+        # CSV読み込み
+        csv_df = load_csv(csv_file)
+        if csv_df is None:
+            st.stop()
+        # OCRでPDFテキスト抽出
+        st.info('PDFをOCRで読み取り中...')
+        pdf_texts = read_pdf_text(pdf_file)
+
+        # 名前候補抽出（CSVの1列目 or "名前"列優先）
+        name_col = None
+        for c in csv_df.columns:
+            if '名' in c:
+                name_col = c
+                break
+        if name_col is None:
+            name_col = csv_df.columns[0]  # 1列目をデフォルト
+        names = csv_df[name_col].fillna('').tolist()
+
+        # 照合結果
+        result = []
+        for page_num, text in enumerate(pdf_texts):
+            found = []
+            for n in names:
+                # 名前がOCR結果に現れるかを判定（完全一致 or 部分一致）
+                if n and (n in text):
+                    found.append(n)
+            result.append({
+                'page': page_num + 1,
+                'names_found': ', '.join(found) if found else '(該当なし)'
+            })
+
+        st.success('照合結果')
+        st.dataframe(pd.DataFrame(result))
+        # 詳細表示
+        with st.expander('PDF各ページのOCRテキスト詳細'):
+            for i, txt in enumerate(pdf_texts):
+                st.markdown(f'**ページ{i+1}**\n{text}')
+
+if __name__ == '__main__':
+    main()
