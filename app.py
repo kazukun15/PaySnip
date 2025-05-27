@@ -1,162 +1,151 @@
 import streamlit as st
 import pandas as pd
-import io, zipfile, re, time
-import numpy as np
+import io
+import zipfile
+import re
+import time
 from datetime import datetime
-from typing import List, Dict
 from pypdf import PdfReader, PdfWriter
-from PIL import Image
-import pytesseract
+import google.generativeai as genai
+from google.api_core.exceptions import InternalServerError
+from st_aggrid import AgGrid, GridOptionsBuilder
 
-# ── アプリ設定 ─────────────────────────────────
+# ── Streamlit 設定 ─────────────────────────────────
 st.set_page_config(page_title="支払通知書抽出ツール", layout="wide")
 st.title("📄 支払通知書抽出ツール")
 
-# ── サイドバー ────────────────────────────────────
-st.sidebar.header("ファイルアップロード")
-pdf_file = st.sidebar.file_uploader("PDFファイル (.pdf)", type="pdf")
-csv_file = st.sidebar.file_uploader("CSVファイル (.csv)", type="csv")
-st.sidebar.markdown("---")
-st.sidebar.header("オプション設定")
-enable_refine = st.sidebar.checkbox("Gemini補正を有効にする", value=False)
-action_preview = st.sidebar.button("プレビュー")
-action_extract = st.sidebar.button("抽出")
+# ── ヘルプ／使い方 ─────────────────────────────────
+st.sidebar.header("🆘 使い方ガイド")
+st.sidebar.markdown(
+    """
+    1. 左サイドバーからPDFとCSVを選択
+    2. 自動でプレビューが表示されます
+    3. エラーがなければ抽出ボタンを押してください
+    4. ZIP形式で支払通知書をダウンロードできます
+    """
+)
 
-# ── データロード関数 ─────────────────────────────────
+# ── サイドバー：ファイルアップロード ─────────────────────────
+pdf_file = st.sidebar.file_uploader("📁 PDFファイルをアップロード", type="pdf", key="pdf_uploader")
+csv_file = st.sidebar.file_uploader("📁 CSVファイルをアップロード", type="csv", key="csv_uploader")
+
+# ── セッションステートにファイルを保持 ─────────────────────
+if 'pdf_bytes' not in st.session_state and pdf_file:
+    st.session_state['pdf_bytes'] = pdf_file.read()
+if 'csv_bytes' not in st.session_state and csv_file:
+    st.session_state['csv_bytes'] = csv_file.read()
+
+# ── Google Gemini 初期化 ─────────────────────────
+gemini_api_key = st.secrets.get("gemini_api_key", "")
+model = None
+if gemini_api_key:
+    genai.configure(api_key=gemini_api_key)
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    except Exception as e:
+        st.sidebar.error(f"Gemini初期化エラー: {e}")
+
+# ── キャッシュ付き読み込み関数 ─────────────────────────
 @st.cache_data
-def load_csv(file) -> pd.DataFrame:
-    for enc in ("utf-8", "cp932", "shift-jis"):
+def load_csv(bytes_data: bytes) -> pd.DataFrame:
+    for enc in ("utf-8", "cp932", "shift_jis"):  
         try:
-            file.seek(0)
-            return pd.read_csv(file, dtype=str, encoding=enc)
+            return pd.read_csv(io.BytesIO(bytes_data), dtype=str, encoding=enc)
         except Exception:
             continue
-    st.error("CSV読み込み失敗: エンコーディングを確認してください。")
-    st.stop()
+    raise ValueError("CSV読み込みに失敗しました。エンコーディングを確認してください。")
 
 @st.cache_data
-def load_pdf_bytes(file) -> bytes:
-    file.seek(0)
-    return file.read()
+def load_pdf(bytes_data: bytes) -> PdfReader:
+    reader = PdfReader(io.BytesIO(bytes_data))
+    if not reader.pages:
+        raise ValueError("PDFにページが含まれていません。")
+    return reader
 
-# ── リソース初期化（遅延ロード） ─────────────────────────────
-@st.cache_resource
-def init_pdf_renderer():
-    import fitz  # PyMuPDF
-    return fitz
+# ── 入力ファイルチェック ─────────────────────────────────
+if 'pdf_bytes' not in st.session_state or 'csv_bytes' not in st.session_state:
+    st.info("PDFとCSVをアップロードすると自動でプレビューします。")
+    st.stop()
 
-@st.cache_resource
-def init_gemini_model(api_key: str):
-    if not api_key:
-        return None
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    try:
-        return genai.GenerativeModel('gemini-2.5-flash-preview-04-17')
-    except Exception:
-        return None
+# ── ファイルロード ─────────────────────────────────────
+try:
+    df_csv = load_csv(st.session_state['csv_bytes'])
+    reader = load_pdf(st.session_state['pdf_bytes'])
+except Exception as e:
+    st.error(f"ファイル読み込みエラー: {e}")
+    st.stop()
 
-# ── OCR 補助関数（Tesseract） ─────────────────────────────
-def ocr_page(fitz, page_bytes: bytes, page_index: int) -> str:
-    doc = fitz.open(stream=page_bytes, filetype="pdf")
-    page = doc.load_page(page_index)
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), colorspace=fitz.csRGB)
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    try:
-        return pytesseract.image_to_string(img, lang='jpn')
-    except:
-        return pytesseract.image_to_string(img)
+# ── CSVプレビュー（AgGrid）──────────────────────────────
+st.subheader("CSVデータプレビュー")
+gb = GridOptionsBuilder.from_dataframe(df_csv)
+gb.configure_pagination(paginationAutoPageSize=True)
+gb.configure_default_column(filterable=True, sortable=True)
+AgGrid(df_csv, gridOptions=gb.build(), height=300)
 
-# ── テキスト正規化・補正 ─────────────────────────────
+# ── 共通関数 ─────────────────────────────────────────
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
-def refine_text(raw: str, page_num: int, model) -> str:
-    if not model:
-        return raw
-    try:
-        prompt = f"PDFの{page_num}ページから抽出された支払通知書テキストを自然な日本語に修正してください:\n{raw}"
-        res = model.generate_content(prompt)
-        return getattr(res, 'text', raw)
-    except:
-        return raw
+# モデル補正関数省略（必要に応じ再定義）
 
-# ── マッチング処理 ─────────────────────────────────
-def find_matches(reader: PdfReader, pdf_bytes: bytes, names: List[str], accounts: List[str], fitz, model) -> List[Dict]:
+# ── マッチング処理────────────────────────────────────
+def match_pages(reader, names_map, accounts_map, use_refine=False):
     results = []
-    for idx, page in enumerate(reader.pages, start=1):
-        # テキストレイヤー抽出
-        raw_text = page.extract_text() or ""
-        # 常にOCRテキストも結合してマッチング精度を向上
-        ocr_text = ocr_page(fitz, pdf_bytes, idx-1)
-        combined = raw_text + "\n" + ocr_text
-        # 補正オプション
-        refined = refine_text(combined, idx, model)
-        norm = normalize_text(refined)
-        found = None
-        # 名前マッチ
-        for name in names:
-            if normalize_text(name) in norm:
-                found = name
+    total = len(reader.pages)
+    for i, page in enumerate(reader.pages, start=1):
+        st.progress(i/total)
+        raw = page.extract_text() or ""
+        norm = normalize_text(raw)
+        # 名前優先
+        matched = None
+        for k,v in names_map.items():
+            if k in norm:
+                matched = v
                 break
-        # 口座番号マッチ
-        if not found:
-            digits = re.sub(r"\D", "", refined)
-            for acc in accounts:
-                if re.sub(r"\D", "", acc) in digits:
-                    found = acc
+        if not matched:
+            digits = re.sub(r"\D", "", norm)
+            for k,v in accounts_map.items():
+                if k in digits:
+                    matched = v
                     break
-        if found:
-            results.append({"page": idx, "match": found})
+        if matched:
+            results.append((i, matched))
     return results
 
-# ── メイン処理 ─────────────────────────────────────
-if not pdf_file or not csv_file:
-    st.warning("PDFとCSVをアップロードしてください。")
-    st.stop()
+# ── マップ生成────────────────────────────────────────
+raw_names = df_csv['相手方'].dropna().tolist()
+names_map = {normalize_text(n): n for n in raw_names}
+raw_accounts = []
+for col in ['口座番号１','口座番号２','口座番号３']:
+    raw_accounts += df_csv.get(col, pd.Series()).dropna().tolist()
+accounts_map = {re.sub(r"\D","",a):a for a in raw_accounts}
 
-csv_df = load_csv(csv_file)
-pdf_bytes = load_pdf_bytes(pdf_file)
-pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+# ── プレビュー結果表示────────────────────────────────
+st.subheader("プレビュー結果（自動マッチング）")
+preview = match_pages(reader, names_map, accounts_map)
+if preview:
+    st.table(pd.DataFrame(preview, columns=['ページ','マッチ']))
+else:
+    st.warning("一致するページが見つかりませんでした。")
 
-names = csv_df.get("相手方", pd.Series()).dropna().str.strip().tolist()
-accounts = sum([csv_df.get(c, pd.Series()).dropna().str.strip().tolist() for c in ["口座番号１","口座番号２","口座番号３"]], [])
-
-st.subheader("CSV プレビュー")
-st.dataframe(csv_df.head(5))
-st.write(f"PDFページ数: {len(pdf_reader.pages)}")
-
-if action_preview:
-    fitz = init_pdf_renderer()
-    model = init_gemini_model(st.secrets.get("gemini", {}).get("api_key", "")) if enable_refine else None
-    with st.spinner("プレビュー中…"):
-        t0 = time.time()
-        preview = find_matches(pdf_reader, pdf_bytes, names, accounts, fitz, model)
-        elapsed = time.time() - t0
-    st.success(f"プレビュー完了 ({elapsed:.2f}s)")
-    st.table(preview or [])
-
-if action_extract:
-    fitz = init_pdf_renderer()
-    model = init_gemini_model(st.secrets.get("gemini", {}).get("api_key", "")) if enable_refine else None
-    with st.spinner("抽出中…"):
-        t0 = time.time()
-        matches = find_matches(pdf_reader, pdf_bytes, names, accounts, fitz, model)
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for m in matches:
-                pg = m['page'] - 1
-                writer = PdfWriter()
-                writer.add_page(pdf_reader.pages[pg])
-                b = io.BytesIO(); writer.write(b)
-                safe = re.sub(r"[\\/:*?\"<>|]", "_", m['match'])
-                fname = f"{datetime.now():%Y%m%d}_支払通知書_{safe}_p{m['page']}.pdf"
-                zf.writestr(fname, b.getvalue())
-        buf.seek(0)
-        elapsed = time.time() - t0
-    if matches:
-        st.success(f"抽出完了 ({elapsed:.2f}s) - {len(matches)} ページを出力しました。")
-        st.download_button("ZIPダウンロード", buf, file_name=f"{datetime.now():%Y%m%d}_支払通知書.zip")
-        st.dataframe(matches)
+# ── 抽出ボタン───────────────────────────────────────
+if st.button("抽出実行", use_container_width=True):
+    start = time.time()
+    matches = match_pages(reader, names_map, accounts_map)
+    if not matches:
+        st.error("抽出対象がありません。")
     else:
-        st.warning(f"一致なし ({elapsed:.2f}s)")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf,'w') as zf:
+            for pg, key in matches:
+                writer = PdfWriter()
+                writer.add_page(reader.pages[pg-1])
+                fbuf = io.BytesIO()
+                writer.write(fbuf)
+                fname = f"{datetime.now():%Y%m%d}_支払通知書_{key}_p{pg}.pdf"
+                zf.writestr(fname, fbuf.getvalue())
+        buf.seek(0)
+        st.download_button("ZIPダウンロード", data=buf,
+                           file_name=f"{datetime.now():%Y%m%d}_支払通知書.zip",
+                           mime="application/zip")
+        st.success(f"完了: {len(matches)} 件 ({time.time()-start:.2f}秒)")
