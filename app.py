@@ -28,10 +28,10 @@ st.sidebar.markdown(
 pdf_file = st.sidebar.file_uploader("📁 PDFファイル", type="pdf")
 csv_file = st.sidebar.file_uploader("📁 CSVファイル", type="csv")
 
-# ── セッションステートに保持 ─────────────────────
-if 'pdf_bytes' not in st.session_state and pdf_file:
+# ── セッションステート保持 ─────────────────────
+if pdf_file and 'pdf_bytes' not in st.session_state:
     st.session_state['pdf_bytes'] = pdf_file.read()
-if 'csv_bytes' not in st.session_state and csv_file:
+if csv_file and 'csv_bytes' not in st.session_state:
     st.session_state['csv_bytes'] = csv_file.read()
 
 # ── Google Gemini 初期化 ─────────────────────────
@@ -78,43 +78,59 @@ except Exception as e:
 st.subheader("CSVプレビュー")
 st.dataframe(df_csv)
 
-# ── 共通関数 ─────────────────────────────────────────
+# ── テキスト正規化 ─────────────────────────────────
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
+# ── 名前抽出 ───────────────────────────────────────
+def extract_name_from_text(text: str) -> str:
+    """
+    PDFテキストから「〜様」直前の名前を抽出
+    """
+    match = re.search(r"([^\s].+?)様", text)
+    if match:
+        return match.group(1).strip()
+    return None
+
 # ── マッチング処理────────────────────────────────────
-def match_pages(reader, names_map, accounts_map):
+def match_pages(reader: PdfReader, names_map: dict, accounts_map: dict) -> list:
     results = []
     total = len(reader.pages)
     progress = st.progress(0)
+
     for idx, page in enumerate(reader.pages, start=1):
-        raw = page.extract_text() or ""
-        norm = normalize_text(raw)
+        raw_text = page.extract_text() or ""
+
+        # 1. PDFテキストから名前を抽出して照合
+        extracted = extract_name_from_text(raw_text)
         matched = None
-        # 名前優先
-        for k,v in names_map.items():
-            if k in norm:
-                matched = v
-                break
-        # 口座番号
+        if extracted:
+            norm_ex = normalize_text(extracted)
+            if norm_ex in names_map:
+                matched = names_map[norm_ex]
+
+        # 2. 名前で見つからなければ口座番号で照合
         if not matched:
-            digits = re.sub(r"\D", "", norm)
-            for k,v in accounts_map.items():
-                if k in digits:
-                    matched = v
+            norm_all = normalize_text(raw_text)
+            digits = re.sub(r"\D", "", norm_all)
+            for acc_norm, acc_orig in accounts_map.items():
+                if acc_norm in digits:
+                    matched = acc_orig
                     break
+
         if matched:
             results.append({"page": idx, "match": matched})
-        progress.progress(idx/total)
+
+        progress.progress(idx / total)
     return results
 
 # ── マップ生成────────────────────────────────────────
-raw_names = df_csv['相手方'].dropna().tolist()
+raw_names = df_csv.get('相手方', pd.Series(dtype=str)).dropna().tolist()
 names_map = {normalize_text(n): n for n in raw_names}
 raw_accounts = []
-for col in ['口座番号１','口座番号２','口座番号３']:
+for col in ['口座番号１', '口座番号２', '口座番号３']:
     raw_accounts += df_csv.get(col, pd.Series(dtype=str)).dropna().tolist()
-accounts_map = {re.sub(r"\D","",a):a for a in raw_accounts}
+accounts_map = {re.sub(r"\D", "", a): a for a in raw_accounts if re.sub(r"\D", "", a)}
 
 # ── プレビュー────────────────────────────────────────
 st.subheader("プレビュー：マッチング結果")
@@ -127,13 +143,12 @@ else:
 # ── 抽出ボタン───────────────────────────────────────
 if st.button("抽出実行", use_container_width=True):
     start = time.time()
-    matches = preview
-    if not matches:
+    if not preview:
         st.error("抽出対象がありません。")
     else:
         buf = io.BytesIO()
-        with zipfile.ZipFile(buf,'w') as zf:
-            for item in matches:
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for item in preview:
                 pg = item['page']
                 key = item['match']
                 writer = PdfWriter()
@@ -148,4 +163,4 @@ if st.button("抽出実行", use_container_width=True):
             file_name=f"{datetime.now():%Y%m%d}_支払通知書.zip",
             mime="application/zip"
         )
-        st.success(f"完了: {len(matches)} 件 ({time.time()-start:.2f}秒)")
+        st.success(f"完了: {len(preview)} 件 ({time.time()-start:.2f}秒)")
