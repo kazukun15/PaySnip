@@ -5,147 +5,114 @@ import zipfile
 import re
 import time
 from datetime import datetime
-from pypdf import PdfWriter
-import fitz  # PyMuPDF for reliable text extraction
+from pypdf import PdfReader, PdfWriter
+import fitz  # PyMuPDF
 
 # ── Streamlit 設定 ─────────────────────────────────
 st.set_page_config(page_title="支払通知書抽出ツール", layout="wide")
-st.title("📄 支払通知書抽出ツール")
+st.title("支払通知書抽出ツール")
 
-# ── サイドバー：使い方 ─────────────────────────────────
-st.sidebar.header("🆘 使い方ガイド")
-st.sidebar.markdown(
-    """
-    1. 左サイドバーからPDFとCSVを選択
-    2. プレビュー結果が表示されるので確認
-    3. 【抽出実行】を押してZIP形式でダウンロード
-    """
-)
+# ── サイドバー：設定・アップロード ─────────────────────────
+st.sidebar.header("ファイル選択")
+pdf_file = st.sidebar.file_uploader("PDFファイル", type="pdf")
+csv_file = st.sidebar.file_uploader("CSVファイル", type="csv")
+preview_btn = st.sidebar.button("プレビュー実行")
+extract_btn = st.sidebar.button("抽出実行")
 
-# ── ファイルアップロード ─────────────────────────
-pdf_file = st.sidebar.file_uploader("📁 PDFファイルを選択", type="pdf")
-csv_file = st.sidebar.file_uploader("📁 CSVファイルを選択", type="csv")
+# ── OCR不要: PyMuPDFで名前検出 ─────────────────────────
+def extract_name_from_page(page) -> str:
+    # テキストブロックをY座標順に取得
+    blocks = sorted(page.get_text('blocks'), key=lambda b: b[1])
+    for b in blocks:
+        text = b[4].strip()
+        if text.endswith('様'):
+            # 例: '町村議会議員共済会 様' -> '町村議会議員共済会'
+            return text[:-1].strip()
+    return ''
 
-# ── アップロードチェック ─────────────────────────
+# ── CSV読み込み ─────────────────────────────────
+def load_csv(uploaded_file):
+    uploaded_file.seek(0)
+    # 全行を読み込む
+    df = pd.read_csv(uploaded_file, dtype=str, encoding='utf-8', engine='python')
+    df = df.fillna('')
+    # 正規化マップ
+    name_map = {re.sub(r'\s+', '', name): name for name in df['相手方'].tolist() if name}
+    acct_list = []
+    for col in ['口座番号１','口座番号２','口座番号３']:
+        acct_list += df[col].dropna().tolist()
+    acct_map = {re.sub(r'\D','',acc): acc for acc in acct_list if acc}
+    return df, name_map, acct_map
+
+# ── PDFリーダー（キャッシュ無効化）─────────────────────────
+def get_pdf_reader(uploaded_file) -> PdfReader:
+    uploaded_file.seek(0)
+    return PdfReader(io.BytesIO(uploaded_file.read()))
+
 if not pdf_file or not csv_file:
-    st.sidebar.info("PDFとCSVをアップロードしてください。")
+    st.info("サイドバーからPDFとCSVをアップロードしてください。")
     st.stop()
 
-# ── ファイル読み込みと可視化 ─────────────────────────
-@st.cache_data
-def load_csv(data: bytes) -> pd.DataFrame:
-    for enc in ("utf-8", "cp932", "shift_jis"):
-        try:
-            return pd.read_csv(io.BytesIO(data), dtype=str, encoding=enc)
-        except Exception:
-            continue
-    raise ValueError("CSVを読み込めません。エンコーディングを確認してください。")
+# データ準備
+csv_df, name_map, acct_map = load_csv(csv_file)
+st.subheader("CSV プレビュー (先頭5行)")
+st.dataframe(csv_df.head())
+pdf_reader = get_pdf_reader(pdf_file)
+st.write(f"PDF: {pdf_file.name}, {len(pdf_reader.pages)} ページ")
 
-@st.cache_data
-def load_docs(pdf_bytes: bytes):
-    # PyPDF と PyMuPDF の両方で読み込み
-    pdf_reader = fitz.open(stream=pdf_bytes, filetype="pdf")
-    return pdf_reader
+# マッチング関数
 
-# セッションストレージ
-if 'pdf_bytes' not in st.session_state:
-    st.session_state['pdf_bytes'] = pdf_file.read()
-if 'csv_bytes' not in st.session_state:
-    st.session_state['csv_bytes'] = csv_file.read()
-
-# 読み込み
-try:
-    df_csv = load_csv(st.session_state['csv_bytes'])
-    fitz_doc = load_docs(st.session_state['pdf_bytes'])
-except Exception as e:
-    st.error(f"ファイル読み込みエラー: {e}")
-    st.stop()
-
-# ── CSVプレビュー ─────────────────────────────────
-st.subheader("📋 CSVプレビュー")
-st.dataframe(df_csv)
-
-# ── 正規化関数 ─────────────────────────────────────
-def normalize_text(s: str) -> str:
-    return re.sub(r"\s+", "", s)
-
-# ── 名称マップ生成 ─────────────────────────────────
-raw_names = df_csv.get('相手方', pd.Series(dtype=str)).dropna().tolist()
-names_map = {normalize_text(n): n for n in raw_names}
-
-# ── 口座番号マップ生成 ─────────────────────────────────
-raw_acc = []
-for col in ['口座番号１', '口座番号２', '口座番号３']:
-    raw_acc += df_csv.get(col, pd.Series(dtype=str)).dropna().tolist()
-accounts_map = {re.sub(r"\D", "", a): a for a in raw_acc if re.sub(r"\D", "", a)}
-
-# ── ページマッチング関数 ─────────────────────────────
-def match_pages(fitz_doc, names_map, accounts_map):
+def match_pages(reader, name_map, acct_map, use_preview=False):
     results = []
-    total = fitz_doc.page_count
-    progress = st.progress(0)
-
-    for i in range(total):
-        page = fitz_doc.load_page(i)
-        blocks = page.get_text('blocks')  # (x0, y0, x1, y1, text, block_no)
-        matched = None
-        # 1. ブロック内の「様」で名前抽出・照合
-        for b in sorted(blocks, key=lambda x: x[1]):  # y0順
-            text = b[4]
-            if '様' in text:
-                # 最初に現れるテキストから「様」前の文字列を取得
-                m = re.search(r'([^\s].+?)様', text)
-                if m:
-                    name = normalize_text(m.group(1))
-                    if name in names_map:
-                        matched = names_map[name]
-                        break
-        # 2. 名前未一致なら口座番号照合
+    for i, page in enumerate(reader.pages, start=1):
+        text_name = extract_name_from_page(page)
+        matched = ''
+        if text_name:
+            key = re.sub(r'\s+','', text_name)
+            if key in name_map:
+                matched = name_map[key]
         if not matched:
-            full_text = normalize_text(page.get_text())
-            digits = re.sub(r"\D", "", full_text)
-            for acc_norm, acc_orig in accounts_map.items():
-                if acc_norm and acc_norm in digits:
-                    matched = acc_orig
+            # ページ全体をテキストで取得して数字抽出
+            txt = page.get_text()
+            digits = re.sub(r'\D','', txt)
+            for ak, ov in acct_map.items():
+                if ak and ak in digits:
+                    matched = ov
                     break
         if matched:
-            results.append({'page': i+1, 'match': matched})
-        progress.progress((i+1)/total)
+            results.append({'page': i, 'match': matched})
     return results
 
-# ── プレビュー結果 ─────────────────────────────────
-st.subheader("🔍 プレビュー：マッチング結果")
-preview = match_pages(fitz_doc, names_map, accounts_map)
-if preview:
-    st.table(preview)
-else:
-    st.warning("一致するページが見つかりませんでした。")
-
-# ── 抽出・ZIP化 ─────────────────────────────────────
-if st.button("🚀 抽出実行", use_container_width=True):
-    if not preview:
-        st.error("抽出対象がありません。")
+# プレビュー
+if preview_btn:
+    st.subheader("プレビュー結果")
+    with st.spinner("プレビュー中…"):
+        preview = match_pages(pdf_reader, name_map, acct_map, use_preview=True)
+    if preview:
+        st.table(pd.DataFrame(preview))
     else:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for item in preview:
-                pg = item['page']
-                key = item['match']
-                writer = PdfWriter()
-                src = fitz_doc.load_page(pg-1).get_pdf_xref()
-                # PyMuPDFページをPyPDFWriterに追加
-                pix = fitz_doc.load_page(pg-1).get_pixmap()
-                # PDF単ページ作成（ここは既存のpypdfを継続利用）
-                writer.add_page(fitz_doc._get_page(pg-1))
-                fbuf = io.BytesIO()
-                writer.write(fbuf)
-                name_safe = re.sub(r'[\\/*?:"<>|]', '_', key)
-                fname = f"{datetime.now():%Y%m%d}_支払通知書_{name_safe}_p{pg}.pdf"
-                zf.writestr(fname, fbuf.getvalue())
-        buf.seek(0)
-        st.download_button(
-            "📥 ZIPダウンロード", data=buf,
-            file_name=f"{datetime.now():%Y%m%d}_支払通知書.zip",
-            mime="application/zip"
-        )
-        st.success(f"完了: {len(preview)} 件 ({time.time()-start:.2f}秒)")
+        st.warning("一致ページなし。")
+
+# 抽出
+if extract_btn:
+    st.subheader("抽出結果")
+    with st.spinner("抽出中…"):
+        matched = match_pages(pdf_reader, name_map, acct_map)
+    if not matched:
+        st.warning("対象ページが見つかりませんでした。")
+        st.stop()
+    # ZIP作成
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for item in matched:
+            idx = item['page'] - 1
+            writer = PdfWriter()
+            writer.add_page(pdf_reader.pages[idx])
+            bio = io.BytesIO()
+            writer.write(bio)
+            bio.seek(0)
+            name_safe = re.sub(r'[\\/*?:"<>|]','_', item['match'])
+            fname = f"{datetime.now():%Y%m%d}_支払通知書_{name_safe}_p{item['page']}.pdf"
+            zf.writestr(fname, bio.read())
+    buf.seek(0)
+    st.download_button("ZIPダウンロード", buf, file_name=f"{datetime.now():%Y%m%d}_支払通知書.zip", mime='application/zip')
