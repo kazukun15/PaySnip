@@ -1,8 +1,6 @@
 streamlit
+pytesseract
+pillow
 pandas
-pypdf
 PyMuPDF
-google-generativeai
-easyocr
-numpy
-Pillow
+pypdf
